@@ -154,19 +154,34 @@ def places_text_search(query, lat, lng, radius_m):
         "radius": radius_m,
         "key": GOOGLE_PLACES_API_KEY,
     }
+    page = 0
     while True:
-        resp = requests.get(PLACES_TEXTSEARCH_URL, params=params, timeout=20)
-        data = resp.json()
-        status = data.get("status")
-        if status not in ("OK", "ZERO_RESULTS"):
-            print(f"  ! Places API error: {status} - {data.get('error_message', '')}", file=sys.stderr)
+        page += 1
+        # A next_page_token isn't valid the instant Google issues it - it
+        # needs a moment to "warm up" server-side. Retry a few times with
+        # backoff instead of giving up on the first INVALID_REQUEST, which is
+        # the normal transient response while the token isn't ready yet.
+        data = None
+        for attempt in range(5):
+            resp = requests.get(PLACES_TEXTSEARCH_URL, params=params, timeout=20)
+            data = resp.json()
+            status = data.get("status")
+            if status in ("OK", "ZERO_RESULTS"):
+                break
+            if status == "INVALID_REQUEST" and "pagetoken" in params and attempt < 4:
+                time.sleep(2 + attempt * 1.5)  # 2s, 3.5s, 5s, 6.5s
+                continue
+            print(f"  ! Places API error on page {page}: {status} - {data.get('error_message', '')}",
+                  file=sys.stderr, flush=True)
+            break
+        if not data or data.get("status") not in ("OK", "ZERO_RESULTS"):
             break
         results.extend(data.get("results", []))
         next_page_token = data.get("next_page_token")
         if not next_page_token:
             break
-        # Google requires a short delay before the token is valid
-        time.sleep(2)
+        # Google requires a short delay before a fresh token is valid at all
+        time.sleep(3)
         params = {"pagetoken": next_page_token, "key": GOOGLE_PLACES_API_KEY}
     return results
 
@@ -187,11 +202,11 @@ def place_details(place_id):
 
 def scrape_places():
     if not GOOGLE_PLACES_API_KEY:
-        print("ERROR: GOOGLE_PLACES_API_KEY is not set.", file=sys.stderr)
+        print("ERROR: GOOGLE_PLACES_API_KEY is not set.", file=sys.stderr, flush=True)
         sys.exit(1)
 
     grid_points = miles_to_grid_points(CENTER_LAT, CENTER_LNG, RADIUS_MILES, GRID_STEP_MILES)
-    print(f"Searching {len(grid_points)} grid points x {len(SEARCH_TERMS)} search terms...")
+    print(f"Searching {len(grid_points)} grid points x {len(SEARCH_TERMS)} search terms...", flush=True)
 
     seen_place_ids = {}
     for gi, (lat, lng) in enumerate(grid_points):
@@ -206,9 +221,9 @@ def scrape_places():
                 if dist > RADIUS_MILES + 2:  # small buffer for grid overlap slop
                     continue
                 seen_place_ids[pid] = r
-        print(f"  grid point {gi + 1}/{len(grid_points)} done, {len(seen_place_ids)} unique so far")
+        print(f"  grid point {gi + 1}/{len(grid_points)} done, {len(seen_place_ids)} unique so far", flush=True)
 
-    print(f"Found {len(seen_place_ids)} unique candidate businesses. Fetching details...")
+    print(f"Found {len(seen_place_ids)} unique candidate businesses. Fetching details...", flush=True)
 
     leads = []
     for pid, basic in seen_place_ids.items():
@@ -233,8 +248,12 @@ def scrape_places():
 # Apollo enrichment (optional)
 # ---------------------------------------------------------------------------
 
+_apollo_diagnostic_printed = False
+
+
 def apollo_enrich(lead):
     """Enrich a lead with Apollo org data by domain, if an API key is set."""
+    global _apollo_diagnostic_printed
     enriched = {
         "apollo_matched": False,
         "employee_count": "",
@@ -249,13 +268,32 @@ def apollo_enrich(lead):
 
     domain = lead["website"].split("//")[-1].split("/")[0].replace("www.", "")
     try:
-        resp = requests.post(
+        resp = requests.get(
             "https://api.apollo.io/api/v1/organizations/enrich",
-            headers={"Cache-Control": "no-cache", "Content-Type": "application/json",
-                     "X-Api-Key": APOLLO_API_KEY},
-            json={"domain": domain},
+            headers={"Cache-Control": "no-cache", "X-Api-Key": APOLLO_API_KEY},
+            params={"domain": domain},
             timeout=20,
         )
+        # Print full diagnostics for the FIRST call only, so a systemic
+        # problem (bad key, wrong plan, rate limit) is visible in the log
+        # without spamming it once per lead.
+        if not _apollo_diagnostic_printed:
+            print(f"  [apollo diag] first enrich call -> status {resp.status_code}, "
+                  f"body: {resp.text[:500]}", file=sys.stderr, flush=True)
+            _apollo_diagnostic_printed = True
+
+        if resp.status_code == 401:
+            print("  ! Apollo enrich: 401 Unauthorized - the API key is invalid or missing "
+                  "the required scope/plan for organization enrichment.", file=sys.stderr, flush=True)
+            return enriched
+        if resp.status_code == 429:
+            print("  ! Apollo enrich: 429 rate limited / out of credits.", file=sys.stderr, flush=True)
+            return enriched
+        if resp.status_code != 200:
+            print(f"  ! Apollo enrich: unexpected status {resp.status_code} for {domain}: "
+                  f"{resp.text[:300]}", file=sys.stderr, flush=True)
+            return enriched
+
         data = resp.json()
         org = data.get("organization")
         if org:
@@ -264,7 +302,7 @@ def apollo_enrich(lead):
             enriched["founded_year"] = org.get("founded_year", "")
             enriched["linkedin_url"] = org.get("linkedin_url", "")
     except requests.RequestException as e:
-        print(f"  ! Apollo enrich failed for {domain}: {e}", file=sys.stderr)
+        print(f"  ! Apollo enrich failed for {domain}: {e}", file=sys.stderr, flush=True)
     return enriched
 
 
@@ -366,7 +404,7 @@ def main():
     raw_leads = scrape_places()
 
     existing_ids = load_existing_place_ids(MASTER_CSV)
-    print(f"{len(existing_ids)} leads already in master list; will skip duplicates on append.")
+    print(f"{len(existing_ids)} leads already in master list; will skip duplicates on append.", flush=True)
 
     final_rows = []
     for lead in raw_leads:
@@ -408,12 +446,12 @@ def main():
     final_rows.sort(key=lambda r: r["score_total"], reverse=True)
 
     write_csv(RUN_CSV, final_rows, append=False)
-    print(f"Wrote {len(final_rows)} leads to {RUN_CSV}")
+    print(f"Wrote {len(final_rows)} leads to {RUN_CSV}", flush=True)
 
     new_for_master = [r for r in final_rows if r["place_id"] not in existing_ids]
     write_csv(MASTER_CSV, new_for_master, append=True)
     print(f"Appended {len(new_for_master)} new leads to {MASTER_CSV} "
-          f"({len(existing_ids) + len(new_for_master)} total in master)")
+          f"({len(existing_ids) + len(new_for_master)} total in master)", flush=True)
 
 
 if __name__ == "__main__":
