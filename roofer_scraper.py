@@ -96,9 +96,9 @@ FIELDNAMES = [
     "contact_name",
     "contact_title",
     "contact_email",
-    "score_web_presence",
-    "score_size_growth",
-    "score_total",
+    "score_web_opportunity",
+    "score_size_opportunity",
+    "opportunity_score",
     "source",
     "date_scraped",
 ]
@@ -310,65 +310,91 @@ def apollo_enrich(lead):
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_web_presence(lead):
+def score_web_opportunity(lead):
+    """Higher score = bigger opportunity for a marketing agency, i.e. WEAKER
+    existing web presence. A roofer with no website, a low rating, or few
+    reviews needs help (and is worth calling); one with a great site and 500
+    five-star reviews almost certainly already has marketing in place."""
     score = 0
-    if lead.get("website"):
-        score += 35
-    if lead.get("phone"):
-        score += 15
+
+    # No website at all is the single biggest opportunity signal.
+    if not lead.get("website"):
+        score += 40
+    else:
+        score += 10  # has a site, but it may still be outdated/unoptimized - can't tell from Places data alone
+
     rating = lead.get("google_rating") or 0
     try:
         rating = float(rating)
     except (TypeError, ValueError):
         rating = 0
-    score += min(rating / 5.0 * 30, 30)
+    if rating == 0:
+        score += 25  # no rating at all - essentially invisible online
+    elif rating < 4.0:
+        score += 25
+    elif rating < 4.5:
+        score += 12
+    elif rating < 4.8:
+        score += 5
+    # 4.8+ rating: no points, reputation is already excellent
+
     reviews = lead.get("google_review_count") or 0
     try:
         reviews = int(reviews)
     except (TypeError, ValueError):
         reviews = 0
-    if reviews >= 100:
+    if reviews == 0:
         score += 20
-    elif reviews >= 25:
-        score += 12
-    elif reviews >= 5:
-        score += 5
-    if lead.get("business_status") == "OPERATIONAL":
-        score += 0  # neutral baseline; non-operational businesses are filtered elsewhere
-    return round(min(score, 100), 1)
+    elif reviews < 10:
+        score += 15
+    elif reviews < 25:
+        score += 8
+    elif reviews < 100:
+        score += 3
+    # 100+ reviews: no points, well-established review volume already
+
+    if not lead.get("phone"):
+        score -= 10  # can't cold call or voicemail-drop without a number - real penalty, not just fewer points
+
+    return round(max(0, min(score, 100)), 1)
 
 
-def score_size_growth(lead):
+def score_size_opportunity(lead):
+    """Optional signal from Apollo (only populated if Apollo enrichment is
+    on and working). A small, newer shop is a more approachable prospect for
+    an agency - established with a big team is more likely to already have
+    marketing handled or a bigger budget to be picky about vendors. This
+    contributes 0 for every lead if Apollo is disabled or unmatched, which
+    just means score_total collapses to the web-opportunity score alone."""
+    if not lead.get("apollo_matched"):
+        return 0.0
+
     score = 0
     emp = lead.get("employee_count")
     try:
         emp = int(emp)
     except (TypeError, ValueError):
         emp = 0
-    if emp >= 50:
+    if emp == 0:
+        score += 20  # unknown/unlisted headcount - small enough Apollo has little on them
+    elif emp < 5:
         score += 50
-    elif emp >= 20:
-        score += 35
-    elif emp >= 5:
-        score += 20
-    elif emp >= 1:
+    elif emp < 15:
+        score += 30
+    elif emp < 50:
         score += 10
+    # 50+ employees: no points, likely has marketing resources already
 
     founded = lead.get("founded_year")
     try:
         founded = int(founded)
         years_in_business = date.today().year - founded
-        if years_in_business >= 15:
-            score += 30
-        elif years_in_business >= 7:
-            score += 20
-        elif years_in_business >= 3:
-            score += 10
+        if years_in_business <= 3:
+            score += 50  # newer business, more likely actively looking to grow
+        elif years_in_business <= 8:
+            score += 25
     except (TypeError, ValueError):
         pass
-
-    if lead.get("apollo_matched"):
-        score += 10  # bonus for having a findable corporate footprint at all
 
     return round(min(score, 100), 1)
 
@@ -414,8 +440,8 @@ def main():
         apollo_data = apollo_enrich(lead)
         lead.update(apollo_data)
 
-        web_score = score_web_presence(lead)
-        size_score = score_size_growth(lead)
+        web_score = score_web_opportunity(lead)
+        size_score = score_size_opportunity(lead)
         total_score = round(web_score * SCORE_WEIGHT_WEB + size_score * SCORE_WEIGHT_SIZE, 1)
 
         row = {
@@ -435,15 +461,15 @@ def main():
             "contact_name": lead.get("contact_name", ""),
             "contact_title": lead.get("contact_title", ""),
             "contact_email": lead.get("contact_email", ""),
-            "score_web_presence": web_score,
-            "score_size_growth": size_score,
-            "score_total": total_score,
+            "score_web_opportunity": web_score,
+            "score_size_opportunity": size_score,
+            "opportunity_score": total_score,
             "source": "google_places" + ("+apollo" if lead.get("apollo_matched") else ""),
             "date_scraped": TODAY,
         }
         final_rows.append(row)
 
-    final_rows.sort(key=lambda r: r["score_total"], reverse=True)
+    final_rows.sort(key=lambda r: r["opportunity_score"], reverse=True)
 
     write_csv(RUN_CSV, final_rows, append=False)
     print(f"Wrote {len(final_rows)} leads to {RUN_CSV}", flush=True)
