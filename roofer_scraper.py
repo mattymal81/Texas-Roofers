@@ -22,6 +22,8 @@ SETUP
 3. Set environment variables (or edit the CONFIG section below):
      export GOOGLE_PLACES_API_KEY="your-key-here"
      export APOLLO_API_KEY="your-apollo-key-here"   # optional, enables enrichment
+     export TWILIO_ACCOUNT_SID="your-twilio-sid"    # optional, enables mobile/landline verification
+     export TWILIO_AUTH_TOKEN="your-twilio-token"   # optional, enables mobile/landline verification
 4. Run:
      python3 roofer_scraper.py
 
@@ -51,6 +53,8 @@ import requests
 
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
 APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
 # Center point: The Woodlands, TX
 CENTER_LAT = 30.1658
@@ -99,6 +103,8 @@ FIELDNAMES = [
     "score_web_opportunity",
     "score_size_opportunity",
     "opportunity_score",
+    "phone_line_type",
+    "is_mobile",
     "source",
     "date_scraped",
 ]
@@ -307,6 +313,74 @@ def apollo_enrich(lead):
 
 
 # ---------------------------------------------------------------------------
+# Phone line-type verification (Twilio Lookup, optional)
+# ---------------------------------------------------------------------------
+
+_twilio_diagnostic_printed = False
+
+
+def to_e164(phone, default_country="US"):
+    """Best-effort conversion of a US-formatted phone string like
+    '(281) 555-1234' into E.164 (+12815551234). Returns None if it doesn't
+    look like a usable 10 or 11-digit US number."""
+    if not phone:
+        return None
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return None
+
+
+def twilio_lookup_phone(phone):
+    """Look up a phone number's line type (mobile/landline/voip/etc.) via
+    Twilio Lookup v2. Returns (line_type, is_mobile) where both are "" / ""
+    if lookup is disabled, the number can't be normalized, or the call
+    fails - this never blocks the rest of the scrape."""
+    global _twilio_diagnostic_printed
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        return "", ""
+
+    e164 = to_e164(phone)
+    if not e164:
+        return "", ""
+
+    try:
+        resp = requests.get(
+            f"https://lookups.twilio.com/v2/PhoneNumbers/{e164}",
+            params={"Fields": "line_type_intelligence"},
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            timeout=15,
+        )
+        if not _twilio_diagnostic_printed:
+            print(f"  [twilio diag] first lookup call -> status {resp.status_code}, "
+                  f"body: {resp.text[:500]}", file=sys.stderr, flush=True)
+            _twilio_diagnostic_printed = True
+
+        if resp.status_code == 401:
+            print("  ! Twilio lookup: 401 Unauthorized - check TWILIO_ACCOUNT_SID / "
+                  "TWILIO_AUTH_TOKEN secrets.", file=sys.stderr, flush=True)
+            return "", ""
+        if resp.status_code == 429:
+            print("  ! Twilio lookup: 429 rate limited.", file=sys.stderr, flush=True)
+            return "", ""
+        if resp.status_code != 200:
+            print(f"  ! Twilio lookup: unexpected status {resp.status_code} for {e164}: "
+                  f"{resp.text[:300]}", file=sys.stderr, flush=True)
+            return "", ""
+
+        data = resp.json()
+        lti = data.get("line_type_intelligence") or {}
+        line_type = lti.get("type", "")
+        is_mobile = "true" if line_type == "mobile" else ("false" if line_type else "")
+        return line_type, is_mobile
+    except requests.RequestException as e:
+        print(f"  ! Twilio lookup failed for {e164}: {e}", file=sys.stderr, flush=True)
+        return "", ""
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
@@ -440,6 +514,8 @@ def main():
         apollo_data = apollo_enrich(lead)
         lead.update(apollo_data)
 
+        phone_line_type, is_mobile = twilio_lookup_phone(lead.get("phone", ""))
+
         web_score = score_web_opportunity(lead)
         size_score = score_size_opportunity(lead)
         total_score = round(web_score * SCORE_WEIGHT_WEB + size_score * SCORE_WEIGHT_SIZE, 1)
@@ -464,6 +540,8 @@ def main():
             "score_web_opportunity": web_score,
             "score_size_opportunity": size_score,
             "opportunity_score": total_score,
+            "phone_line_type": phone_line_type,
+            "is_mobile": is_mobile,
             "source": "google_places" + ("+apollo" if lead.get("apollo_matched") else ""),
             "date_scraped": TODAY,
         }
