@@ -1,0 +1,40 @@
+name: Scrape Roofer Leads
+
+on:
+  workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the CSV results back
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run scraper
+        env:
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+          APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
+        run: python3 roofer_scraper.py
+
+      - name: Commit results back to repo
+        run: |
+          git config user.name "roofer-lead-scraper-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add roofer_leads_master.csv roofer_leads_*.csv
+          if git diff --cached --quiet; then
+            echo "No new leads this run — nothing to commit."
+          else
+            git commit -m "Scrape run: $(date -u +'%Y-%m-%d')"
+            git push
+          fi
