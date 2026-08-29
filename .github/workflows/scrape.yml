@@ -25,6 +25,8 @@ jobs:
         env:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
           APOLLO_API_KEY: ${{ secrets.APOLLO_API_KEY }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
         run: python3 roofer_scraper.py
 
       - name: Commit results back to repo
