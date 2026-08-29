@@ -3,10 +3,10 @@
 IGA Lead Scraper - Roofers in Texas (v1)
 ------------------------------------------------
 Scrapes roofing companies within a radius of a center point (default: The
-Woodlands, TX, 50 miles) using the Google Places API, optionally enriches
-each company with Apollo.io firmographic data, scores each lead, and writes
-out a de-duplicated CSV (and appends to a master CSV used as your running
-master list).
+Woodlands, TX, 50 miles) using the Google Places API, verifies each phone
+number's line type via Twilio Lookup, scores each lead by cold-call
+opportunity, and writes out a de-duplicated CSV (and appends to a master CSV
+used as your running master list).
 
 WHY THIS RUNS LOCALLY, NOT INSIDE THE CLAUDE SESSION:
 Anthropic's cloud sandbox that Claude works in only has network access to an
@@ -21,7 +21,6 @@ SETUP
 2. pip install requests
 3. Set environment variables (or edit the CONFIG section below):
      export GOOGLE_PLACES_API_KEY="your-key-here"
-     export APOLLO_API_KEY="your-apollo-key-here"   # optional, enables enrichment
      export TWILIO_ACCOUNT_SID="your-twilio-sid"    # optional, enables mobile/landline verification
      export TWILIO_AUTH_TOKEN="your-twilio-token"   # optional, enables mobile/landline verification
 4. Run:
@@ -52,7 +51,6 @@ import requests
 # ---------------------------------------------------------------------------
 
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "")
-APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 
@@ -76,9 +74,6 @@ SEARCH_TERMS = [
 GRID_STEP_MILES = 20  # spacing between grid centers
 SUB_RADIUS_METERS = 30000  # ~18.6 miles per sub-search, overlapping for coverage
 
-SCORE_WEIGHT_WEB = 0.60
-SCORE_WEIGHT_SIZE = 0.40
-
 MASTER_CSV = "roofer_leads_master.csv"
 TODAY = date.today().isoformat()
 RUN_CSV = f"roofer_leads_{TODAY}.csv"
@@ -93,15 +88,6 @@ FIELDNAMES = [
     "google_rating",
     "google_review_count",
     "business_status",
-    "apollo_matched",
-    "employee_count",
-    "founded_year",
-    "linkedin_url",
-    "contact_name",
-    "contact_title",
-    "contact_email",
-    "score_web_opportunity",
-    "score_size_opportunity",
     "opportunity_score",
     "phone_line_type",
     "is_mobile",
@@ -251,68 +237,6 @@ def scrape_places():
 
 
 # ---------------------------------------------------------------------------
-# Apollo enrichment (optional)
-# ---------------------------------------------------------------------------
-
-_apollo_diagnostic_printed = False
-
-
-def apollo_enrich(lead):
-    """Enrich a lead with Apollo org data by domain, if an API key is set."""
-    global _apollo_diagnostic_printed
-    enriched = {
-        "apollo_matched": False,
-        "employee_count": "",
-        "founded_year": "",
-        "linkedin_url": "",
-        "contact_name": "",
-        "contact_title": "",
-        "contact_email": "",
-    }
-    if not APOLLO_API_KEY or not lead.get("website"):
-        return enriched
-
-    domain = lead["website"].split("//")[-1].split("/")[0].replace("www.", "")
-    try:
-        resp = requests.get(
-            "https://api.apollo.io/api/v1/organizations/enrich",
-            headers={"Cache-Control": "no-cache", "X-Api-Key": APOLLO_API_KEY},
-            params={"domain": domain},
-            timeout=20,
-        )
-        # Print full diagnostics for the FIRST call only, so a systemic
-        # problem (bad key, wrong plan, rate limit) is visible in the log
-        # without spamming it once per lead.
-        if not _apollo_diagnostic_printed:
-            print(f"  [apollo diag] first enrich call -> status {resp.status_code}, "
-                  f"body: {resp.text[:500]}", file=sys.stderr, flush=True)
-            _apollo_diagnostic_printed = True
-
-        if resp.status_code == 401:
-            print("  ! Apollo enrich: 401 Unauthorized - the API key is invalid or missing "
-                  "the required scope/plan for organization enrichment.", file=sys.stderr, flush=True)
-            return enriched
-        if resp.status_code == 429:
-            print("  ! Apollo enrich: 429 rate limited / out of credits.", file=sys.stderr, flush=True)
-            return enriched
-        if resp.status_code != 200:
-            print(f"  ! Apollo enrich: unexpected status {resp.status_code} for {domain}: "
-                  f"{resp.text[:300]}", file=sys.stderr, flush=True)
-            return enriched
-
-        data = resp.json()
-        org = data.get("organization")
-        if org:
-            enriched["apollo_matched"] = True
-            enriched["employee_count"] = org.get("estimated_num_employees", "")
-            enriched["founded_year"] = org.get("founded_year", "")
-            enriched["linkedin_url"] = org.get("linkedin_url", "")
-    except requests.RequestException as e:
-        print(f"  ! Apollo enrich failed for {domain}: {e}", file=sys.stderr, flush=True)
-    return enriched
-
-
-# ---------------------------------------------------------------------------
 # Phone line-type verification (Twilio Lookup, optional)
 # ---------------------------------------------------------------------------
 
@@ -433,46 +357,6 @@ def score_web_opportunity(lead):
     return round(max(0, min(score, 100)), 1)
 
 
-def score_size_opportunity(lead):
-    """Optional signal from Apollo (only populated if Apollo enrichment is
-    on and working). A small, newer shop is a more approachable prospect for
-    an agency - established with a big team is more likely to already have
-    marketing handled or a bigger budget to be picky about vendors. This
-    contributes 0 for every lead if Apollo is disabled or unmatched, which
-    just means score_total collapses to the web-opportunity score alone."""
-    if not lead.get("apollo_matched"):
-        return 0.0
-
-    score = 0
-    emp = lead.get("employee_count")
-    try:
-        emp = int(emp)
-    except (TypeError, ValueError):
-        emp = 0
-    if emp == 0:
-        score += 20  # unknown/unlisted headcount - small enough Apollo has little on them
-    elif emp < 5:
-        score += 50
-    elif emp < 15:
-        score += 30
-    elif emp < 50:
-        score += 10
-    # 50+ employees: no points, likely has marketing resources already
-
-    founded = lead.get("founded_year")
-    try:
-        founded = int(founded)
-        years_in_business = date.today().year - founded
-        if years_in_business <= 3:
-            score += 50  # newer business, more likely actively looking to grow
-        elif years_in_business <= 8:
-            score += 25
-    except (TypeError, ValueError):
-        pass
-
-    return round(min(score, 100), 1)
-
-
 # ---------------------------------------------------------------------------
 # CSV output
 # ---------------------------------------------------------------------------
@@ -511,14 +395,9 @@ def main():
         if lead.get("business_status") not in ("OPERATIONAL", ""):
             continue  # skip permanently/temporarily closed businesses
 
-        apollo_data = apollo_enrich(lead)
-        lead.update(apollo_data)
-
         phone_line_type, is_mobile = twilio_lookup_phone(lead.get("phone", ""))
 
-        web_score = score_web_opportunity(lead)
-        size_score = score_size_opportunity(lead)
-        total_score = round(web_score * SCORE_WEIGHT_WEB + size_score * SCORE_WEIGHT_SIZE, 1)
+        opportunity_score = score_web_opportunity(lead)
 
         row = {
             "place_id": lead["place_id"],
@@ -530,19 +409,10 @@ def main():
             "google_rating": lead.get("google_rating", ""),
             "google_review_count": lead.get("google_review_count", ""),
             "business_status": lead.get("business_status", ""),
-            "apollo_matched": lead.get("apollo_matched", False),
-            "employee_count": lead.get("employee_count", ""),
-            "founded_year": lead.get("founded_year", ""),
-            "linkedin_url": lead.get("linkedin_url", ""),
-            "contact_name": lead.get("contact_name", ""),
-            "contact_title": lead.get("contact_title", ""),
-            "contact_email": lead.get("contact_email", ""),
-            "score_web_opportunity": web_score,
-            "score_size_opportunity": size_score,
-            "opportunity_score": total_score,
+            "opportunity_score": opportunity_score,
             "phone_line_type": phone_line_type,
             "is_mobile": is_mobile,
-            "source": "google_places" + ("+apollo" if lead.get("apollo_matched") else ""),
+            "source": "google_places",
             "date_scraped": TODAY,
         }
         final_rows.append(row)
