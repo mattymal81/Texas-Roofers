@@ -18,7 +18,6 @@ This scrapes via a GitHub Actions workflow: you click a button on github.com, Gi
 3. **Add your API keys as GitHub Secrets** (this keeps them out of the code, never exposed in logs):
    - Go to the repo → Settings → Secrets and variables → Actions → "New repository secret"
    - Add one named `GOOGLE_PLACES_API_KEY` with your Places API key as the value
-   - Add another named `APOLLO_API_KEY` with your Apollo key (optional — enables employee count / founded year / LinkedIn enrichment)
    - Add `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` (optional — enables mobile/landline verification on every phone number). Sign up at twilio.com (a trial account works fine for Lookup), grab the Account SID and Auth Token from your Twilio Console dashboard, add both as secrets.
 
    Since you shared your Places key in chat earlier, it's worth regenerating/restricting it in Google Cloud Console before pasting it in as the secret, just to be safe.
@@ -36,9 +35,8 @@ Under the hood, each run:
 - Search for roofing contractors/companies/repair/residential/commercial roofing across that grid
 - De-duplicate by Google's place_id
 - Pull details (phone, website, rating, review count) for every match
-- Enrich with Apollo (employee count, founded year, LinkedIn) if `APOLLO_API_KEY` is set and the business has a matched website domain
 - Verify each phone number's line type (mobile / landline / voip) via Twilio Lookup if `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` are set — new `phone_line_type` and `is_mobile` columns tell you which numbers are actually cell phones worth voicemail-dropping vs. office landlines
-- Score each lead 0–100 by **opportunity** — the businesses with the weakest existing web presence (no website, low/no rating, few reviews) rank at the top, since those are your best cold-call targets, not the ones who already have great marketing (60% weighted on web opportunity, 40% weighted on size/growth opportunity)
+- Score each lead 0–100 by **opportunity** — the businesses with the weakest existing web presence (no website, low/no rating, few reviews) rank at the top, since those are your best cold-call targets, not the ones who already have great marketing
 - Write two files:
   - `roofer_leads_YYYY-MM-DD.csv` — this run only
   - `roofer_leads_master.csv` — running master list, new leads appended, duplicates skipped by place_id
@@ -54,7 +52,6 @@ Easiest path for now: download `roofer_leads_master.csv` from the repo → open 
 - `RADIUS_MILES` — currently 50; bump this when you expand statewide
 - `CENTER_LAT` / `CENTER_LNG` — currently The Woodlands, TX; change or add more centers as you expand
 - `SEARCH_TERMS` — the phrases searched against Places; add more if you're missing roofers who describe themselves differently (e.g. "storm damage roof repair", "metal roofing")
-- `SCORE_WEIGHT_WEB` / `SCORE_WEIGHT_SIZE` — currently 0.60 / 0.40 per your instructions
 - `GRID_STEP_MILES` / `SUB_RADIUS_METERS` — grid density; smaller step = more thorough but more API calls (cost)
 
 ## Cost awareness
